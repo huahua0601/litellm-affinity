@@ -1,16 +1,18 @@
-# LiteLLM 会话粘性路由 —— 多账户/多区 Bedrock 共享 Prompt Cache
+# LiteLLM 会话粘性路由 —— 多云/多端点共享 Prompt Cache
 
-> 让同一会话稳定路由到同一个 Bedrock 缓存域,命中 prompt cache、降低成本;
+> 让同一会话稳定路由到同一个上游缓存域,命中 prompt cache、降低成本;
 > 对 Claude Code 开发者和 LiteLLM 管理员双向无感。已在 **litellm 1.90.1** 上端到端验证。
+
+中文 | [English](README.en.md)
 
 ---
 
 ## 1. 背景与问题
 
-同一个模型在 LiteLLM 里配置了**多个 AWS 账户 / 多个 region** 的 Bedrock Claude(为了分摊 TPM 配额)。
-但 **Bedrock prompt cache 按 `(账户, region)` 隔离**:
+同一个模型在 LiteLLM 里可能配置了**多个上游端点**:多个 AWS 账户 / 多个 region 的 Bedrock Claude、多个云厂商、多个项目、多个 API key,或不同容量池(为了分摊 TPM/RPM 配额、做容灾或成本优化)。
+但多数上游的 prompt cache 都按某种**缓存域**隔离,例如 Bedrock 的 `(账户, region)`,或其他云厂商/模型服务里的 `(provider, project, region, credential, deployment)` 等边界:
 
-- 同一会话的多轮请求若被负载均衡甩到不同账户/区,后续轮次**命中不了前面写入的缓存**;
+- 同一会话的多轮请求若被负载均衡甩到不同缓存域,后续轮次**命中不了前面写入的缓存**;
 - 结果是反复付 cache **写入**(基础输入价的 1.25×),而拿不到 cache **读取**(0.1×)的便宜。
 
 LiteLLM 默认的负载均衡策略(`simple-shuffle` 等)是**无状态**的,每个请求独立选 deployment,所以天然破坏会话粘性。
@@ -21,7 +23,7 @@ LiteLLM 默认的负载均衡策略(`simple-shuffle` 等)是**无状态**的,每
 
 ## 2. 方案概述
 
-一个 LiteLLM `async_pre_call_hook` 自定义回调,在请求发往 Bedrock **之前**:
+一个 LiteLLM `async_pre_call_hook` 自定义回调,在请求发往上游模型服务 **之前**:
 
 1. 从请求里取一个**稳定的会话标识**(优先 `metadata.user_id`/`session_id`,否则用 `system + 首条消息`);
 2. 用**加权 Rendezvous(HRW)哈希**在"当前健康(未 cooldown)"的端点里选一个;
@@ -31,10 +33,11 @@ LiteLLM 默认的负载均衡策略(`simple-shuffle` 等)是**无状态**的,每
 
 | 能力 | 说明 |
 |---|---|
-| 会话粘性 | 同一会话永远落同一端点 → 缓存稳定命中 |
+| 会话粘性 | 同一会话永远落同一缓存域/端点 → 缓存稳定命中 |
 | 加权分配 | 按 `model_info.hrw_weight` 成比例分配流量(配额大的多吃) |
 | 健康感知 | 端点 cooldown 时自动剔除,其会话迁移到健康端点 |
 | 最小搬动 | 端点增/减只影响"原本落在它上面"的会话,其余纹丝不动 |
+| 多云可用 | 只依赖 LiteLLM deployment tag,可用于 Bedrock、Vertex AI、Anthropic、OpenAI-compatible 等多端点模型组 |
 | 双向无感 | 纯 `config.yaml` + 一个回调文件;开发者、管理员都不用逐人配置 |
 | 安全降级 | 所有内部 API 调用都有 `except` 兜底,坏了只降级、不阻断请求 |
 
@@ -61,7 +64,7 @@ LiteLLM 默认的负载均衡策略(`simple-shuffle` 等)是**无状态**的,每
 litellm-affinity/
 ├── README.md
 ├── pytest.ini                          # pythonpath=src / testpaths=tests
-├── real_config.yaml                    # 真实 Bedrock 配置 ┐
+├── real_config.yaml                    # 真实上游配置示例   ┐
 ├── test_config.yaml                    # mock 测试配置     ├ 必须和 hook 同目录(见下)
 ├── session_affinity.py → src/...       # 软链接到源        ┘
 ├── src/
@@ -82,24 +85,24 @@ litellm-affinity/
 
 ### 4.2 config.yaml(关键片段)
 
-每个账户/区一条 deployment,**同一个 `model_name`**,各带**唯一 tag** 和权重:
+每个缓存域/上游端点一条 deployment,**同一个 `model_name`**,各带**唯一 tag** 和权重。下面用 Bedrock 举例;换成其他云或 OpenAI-compatible 端点时,只需要把 `litellm_params` 改成对应 provider 的字段,tag/weight 规则不变:
 
 ```yaml
 model_list:
   - model_name: claude-sonnet
     litellm_params:
-      model: bedrock/us.anthropic.claude-...       # 或各账户的 bedrock 模型
+      model: bedrock/us.anthropic.claude-...       # 或任意 LiteLLM 支持的 provider/model
       aws_region_name: us-east-1
-      # 账户A 凭证(aws_access_key_id/secret 或 api_key: os.environ/AWS_BEARER_TOKEN_BEDROCK)
-      tags: ["acct-0"]
+      # 缓存域 A 的凭证(如 AWS 账户/region、GCP 项目/region、OpenAI-compatible base_url/api_key)
+      tags: ["cache-domain-0"]
     model_info:
       id: dep-a
       hrw_weight: 3                                  # ← 相对权重(配额/容量)
   - model_name: claude-sonnet
     litellm_params:
-      model: bedrock/...
+      model: bedrock/...                           # 也可以是另一云厂商或另一容量池
       aws_region_name: ...
-      tags: ["acct-1"]
+      tags: ["cache-domain-1"]
     model_info:
       id: dep-b
       hrw_weight: 1
@@ -114,8 +117,8 @@ general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
 ```
 
-> **单一事实源**:账户数、tag、权重全在 `model_list` 里;回调启动时自己读,不会漂移。
-> 改账户/权重只动 config,不动代码。
+> **单一事实源**:端点数、tag、权重全在 `model_list` 里;回调启动时自己读,不会漂移。
+> 改云厂商、账户、区域、容量池或权重只动 config,不动代码。
 
 ### 4.3 session_affinity.py
 
@@ -177,10 +180,10 @@ general_settings:
 ```
 这份 config 仍需与 `session_affinity.py`(软链接到 `src/`)放在同目录、从该目录启动(见 §4.1 说明)。
 
-**第二步:UI 上加端点**(Models → Add Model,每个账户一条):
-- **Model Name**:所有账户填**同一个**(如 `claude-sonnet`)组成一个组
-- **Provider / Model / 凭证 / Region**:该账户的 Bedrock 模型与凭证
-- **Advanced Settings → Tags**:`acct-0`(每个账户**唯一**)
+**第二步:UI 上加端点**(Models → Add Model,每个缓存域一条):
+- **Model Name**:所有端点填**同一个**(如 `claude-sonnet`)组成一个组
+- **Provider / Model / 凭证 / Region / Base URL**:该缓存域对应的云厂商、模型与凭证
+- **Advanced Settings → Tags**:`cache-domain-0`(每个缓存域**唯一**)
 - **Advanced Settings → Weight**:`3`(hook 同时认 `litellm_params.weight` 与 `model_info.hrw_weight`)
 
 **等价 `/model/new` API(字段最精确,版本无关)**:
@@ -193,12 +196,12 @@ curl -X POST http://<host>:4000/model/new \
       "model": "bedrock/us.anthropic.claude-opus-4-7",
       "aws_region_name": "us-east-1",
       "api_key": "os.environ/AWS_BEARER_TOKEN_BEDROCK",
-      "tags": ["acct-0"], "weight": 3
+      "tags": ["cache-domain-0"], "weight": 3
     },
     "model_info": { "hrw_weight": 3 }
   }'
 ```
-重复添加 acct-1 / acct-2……。UI/API 加完**无需重启**,下一条请求 hook 即纳入加权 HRW。
+重复添加 cache-domain-1 / cache-domain-2……。UI/API 加完**无需重启**,下一条请求 hook 即纳入加权 HRW。
 
 > 权重来源优先级:`model_info.hrw_weight` → `litellm_params.weight` → 默认 1。
 > 两处任填其一即可;tag 路由已把请求钉到单个 deployment,故 litellm 内建的 `weight` 加权在此是惰性的,可安全复用。
@@ -227,11 +230,13 @@ curl -X POST http://<host>:4000/model/new \
 
 ### 6.1 真实 Bedrock 缓存命中(opus-4-7,US / JP / EU 三个跨区 profile)
 
+以下是 Bedrock 上的实测结果;多云场景的前提相同:上游支持 prompt cache,且不同端点之间存在独立缓存域。
+
 | 步骤 | 端点 | cache_creation | cache_read | 结论 |
 |---|---|---|---|---|
 | 域A 首次 | US | 11057 | 0 | 写入缓存 |
 | 域A 再次 | US | 0 | **11057** | ✅ 命中 |
-| 域B 同 prompt | JP | 11057 | 0 | ❌ 未命中(换域 = 跨账户等价场景) |
+| 域B 同 prompt | JP | 11057 | 0 | ❌ 未命中(换域 = 跨账户/跨云等价场景) |
 | 同会话(回调路由) | 同一端点 ×2 | 0 | **11057** | ✅ 粘性带来持续命中 |
 
 > 缓存命中后那段 prefix 成本约降到 **1/12**(读 0.1× vs 写 1.25×)。
@@ -269,7 +274,7 @@ dep-eu   96  (16.0% vs 16.7%)
 
 端到端(可选,需启动 proxy):
 - `scripts/run_distribution.py` —— 真实 proxy 上验证权重分布(极小请求,成本可忽略)。
-- `scripts/run_real_test.py` —— 真实 Bedrock 验证缓存命中(需 `secrets/.secrets.env` 凭证)。
+- `scripts/run_real_test.py` —— 真实上游验证缓存命中(当前示例为 Bedrock,需 `secrets/.secrets.env` 凭证)。
 
 **升级 runbook**:
 1. 改 pin 到目标版本,隔离环境安装;
@@ -297,7 +302,8 @@ dep-eu   96  (16.0% vs 16.7%)
 
 - 健康过滤依赖 litellm 内部 `_get_healthy_deployments`(有兜底,但升级需用 L2 契约测试守住)。
 - 单端点精确匹配单 tag,故端点级容错靠回调的健康感知 + 上述 fallback,而非 tag 自身。
-- 缓存边界是 `(账户, region)`;跨区 inference profile(`global.` 等)会让"按区隔离"失真,测试/生产请用 geo 明确的 profile(`us.` / `jp.` / `eu.` / `au.`)或直连区域模型。
+- 缓存边界由上游 provider 决定;本 hook 只能保证同一会话落到同一 LiteLLM deployment/tag,不能把不同上游缓存域合并成一个。
+- Bedrock 场景下缓存边界通常是 `(账户, region)`;跨区 inference profile(`global.` 等)会让"按区隔离"失真,测试/生产请用 geo 明确的 profile(`us.` / `jp.` / `eu.` / `au.`)或直连区域模型。
 
 ---
 
@@ -305,6 +311,7 @@ dep-eu   96  (16.0% vs 16.7%)
 
 | 路径 | 说明 |
 |---|---|
+| `README.md` / `README.en.md` | 中文 / 英文说明文档 |
 | `src/session_affinity.py` | 生产级回调(粘性 + 加权 HRW + 健康感知) |
 | `real_config.yaml` / `test_config.yaml`(项目根) | proxy 配置(真实 Bedrock / mock 测试) |
 | `session_affinity.py`(根,软链接 → `src/`) | 让 litellm 在 config 同目录找到 callback |
