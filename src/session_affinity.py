@@ -1,7 +1,7 @@
 """Session-affinity routing for LiteLLM via weighted Rendezvous (HRW) hashing.
 
-把同一会话稳定路由到同一个账户(tag),从而命中 Bedrock prompt cache;
-按 model_info.hrw_weight 加权分配;只在“当前健康(未 cooldown)”的账户里选。
+把同一会话稳定路由到同一个端点/缓存域(tag),从而命中上游 prompt cache;
+按 model_info.hrw_weight 加权分配;只在“当前健康(未 cooldown)”的端点里选。
 所有内部 API 调用都有 except 兜底:坏了也只降级,不阻断请求。
 """
 import hashlib
@@ -61,7 +61,7 @@ class SessionAffinity(CustomLogger):
         return res or []
 
     async def _candidates(self, model):
-        """返回 {tag: weight};优先只含当前健康账户,读不到健康信息就退回全部。"""
+        """返回 {tag: weight};优先只含当前健康端点,读不到健康信息就退回全部。"""
         from litellm.proxy.proxy_server import llm_router as r
         if r is None:
             return {}
