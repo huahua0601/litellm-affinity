@@ -1,0 +1,37 @@
+model_list:
+  - model_name: claude-sonnet
+    litellm_params:
+      model: openai/fake
+      api_key: sk-fake
+      mock_response: "ok-from-acct-0"
+      tags: ["acct-0"]
+    model_info:
+      id: id-acct-0
+      hrw_weight: 3
+  - model_name: claude-sonnet
+    litellm_params:
+      model: openai/fake
+      api_key: sk-fake
+      mock_response: "ok-from-acct-1"
+      tags: ["acct-1"]
+    model_info:
+      id: id-acct-1
+      hrw_weight: 1
+  - model_name: claude-sonnet
+    litellm_params:
+      model: openai/fake
+      api_key: sk-fake
+      mock_response: "ok-from-acct-2"
+      tags: ["acct-2"]
+    model_info:
+      id: id-acct-2
+      hrw_weight: 2
+
+router_settings:
+  enable_tag_filtering: true
+
+litellm_settings:
+  callbacks: session_affinity.proxy_handler_instance
+
+general_settings:
+  master_key: sk-test

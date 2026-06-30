@@ -1,0 +1,5 @@
+secrets/.secrets.env
+.venv/
+*.log
+__pycache__/
+.pytest_cache/
