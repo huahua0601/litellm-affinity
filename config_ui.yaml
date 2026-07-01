@@ -1,0 +1,14 @@
+# UI 测试用配置:端点留空,在 UI / /model/new 上添加。
+# 必须与根目录的 session_affinity.py(软链接→src)同目录、从根启动。
+model_list: []
+
+router_settings:
+  enable_tag_filtering: true
+
+litellm_settings:
+  callbacks: session_affinity.proxy_handler_instance
+
+general_settings:
+  master_key: sk-affinity-test
+  store_model_in_db: true
+  # database_url / UI 登录走环境变量(见启动命令)
