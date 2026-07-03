@@ -206,6 +206,50 @@ curl -X POST http://<host>:4000/model/new \
 > 权重来源优先级:`model_info.hrw_weight` → `litellm_params.weight` → 默认 1。
 > 两处任填其一即可;tag 路由已把请求钉到单个 deployment,故 litellm 内建的 `weight` 加权在此是惰性的,可安全复用。
 
+### 4.7 用 Application Inference Profile ARN(且保住 1h 缓存)
+
+想用 Bedrock **application inference profile**(自定义推理配置,ARN 形如
+`arn:aws:bedrock:us-east-1:<acct>:application-inference-profile/<opaque-id>`)作为端点时,
+**不能**直接把 ARN 填进 `litellm_params.model`。原因:
+
+- 这类 ARN 结尾是**不透明 id**(如 `raefjm3jcgd9`),不含模型名子串。
+- litellm 判断"是否支持 1h 缓存"用的是 `is_claude_4_5_on_bedrock(model)`——它拿
+  `litellm_params.model` 去价格表/名字里找 opus/sonnet 特征。传 ARN 时**找不到 → 判 False →
+  litellm 把 `ttl: "1h"` 剥掉,静默降级回 5min**(端点仍能调通、定价靠 `base_model` 也对,唯独 1h 失效)。
+
+**正确写法:`model` 与 `model_id` 分离**——`model` 填**明文模型名**让 litellm 识别能力,
+`model_id` 填 **ARN** 指定实际调用目标:
+
+```bash
+curl -X POST http://<host>:4000/model/new \
+  -H "Authorization: Bearer $LITELLM_MASTER_KEY" -H "Content-Type: application/json" \
+  -d '{
+    "model_name": "opus-47-appprofile",
+    "litellm_params": {
+      "model": "anthropic.claude-opus-4-7",
+      "model_id": "arn:aws:bedrock:us-east-1:<acct>:application-inference-profile/<opaque-id>",
+      "aws_region_name": "us-east-1"
+    },
+    "model_info": { "base_model": "us.anthropic.claude-opus-4-7" }
+  }'
+```
+
+各字段职责(litellm 1.92.0,`converse_handler.py` 实测确认):
+
+| 字段 | 作用 |
+|---|---|
+| `litellm_params.model` = 明文模型名 | 只用于**能力/定价/1h 判定**;让 `is_claude_4_5_on_bedrock` 认出是 opus → 放行 `ttl:1h` |
+| `litellm_params.model_id` = ARN | **实际请求目标**;handler 取 `model_id` 后 `encode_model_id` 作为真正的 Bedrock `modelId`,即打到该 inference profile |
+| `model_info.base_model` | 定价/能力回退锚点 |
+
+> Application inference profile ARN **强制走 converse 路由**(ARN 无 provider 子串,invoke 路径无法解析)。
+> converse 的 `/v1/chat/completions` usage 只给 `cache_read/creation`,**不给 5m/1h 分档**;要确认
+> 命中的确实是 **1h 档**,用 `/v1/messages` 请求看 `usage.cache_creation.ephemeral_1h_input_tokens`。
+
+**实测结论(opus-4-7 + 上述配置)**:请求命中该端点(`x-litellm-model-id` = 该 id),
+`/v1/messages` 首轮 `ephemeral_1h_input_tokens` = 全部 prefix、次轮 `cache_read_input_tokens` 命中 →
+**inference profile 生效 + 1h 缓存生效,且无需改 litellm 源码**。
+
 ---
 
 ## 5. 关键实现要点 / 踩过的坑
