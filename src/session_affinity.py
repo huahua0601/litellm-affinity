@@ -27,6 +27,44 @@ def _wscore(key, tag, weight):
 
 class SessionAffinity(CustomLogger):
 
+    # 把请求里已有的 prompt-cache 断点 ttl 统一改写成这个值(如 "1h")。
+    # 设为 None 关闭改写,保持客户端原样(Claude Code 默认 = 5min)。
+    # 注意:仅当底层模型被 litellm 认作支持 1h(如 Claude 4.5/4.6/opus-4.7)时才真正生效,
+    # 否则 litellm 会在发往 Bedrock 前剥掉 ttl 降级回 5min(不报错)。
+    force_cache_ttl = "1h"
+
+    def _rewrite_cache_ttl(self, data):
+        """把 data 里已存在的 ephemeral cache_control 断点的 ttl 就地改成 force_cache_ttl。
+
+        只改**已有断点**(不新增,避免改变客户端的缓存语义/断点数量);
+        仅处理 list 形态的 system / message content(str 挂不上 cache_control);
+        全程兜底,失败只降级(保持原样),绝不阻断请求。
+        """
+        ttl = self.force_cache_ttl
+        if not ttl:
+            return
+        try:
+            def fix(block):
+                if not isinstance(block, dict):
+                    return
+                cc = block.get("cache_control")
+                if isinstance(cc, dict) and cc.get("type") == "ephemeral":
+                    cc["ttl"] = ttl
+
+            system = data.get("system")
+            if isinstance(system, list):
+                for b in system:
+                    fix(b)
+            for m in data.get("messages") or []:
+                c = m.get("content") if isinstance(m, dict) else None
+                if isinstance(c, list):
+                    for b in c:
+                        fix(b)
+            for t in data.get("tools") or []:
+                fix(t)
+        except Exception as e:
+            log.warning("cache-ttl rewrite skipped: %r", e)
+
     def _tag_weight(self, dep):
         lp = dep.get("litellm_params") or {}
         mi = dep.get("model_info") or {}
@@ -114,6 +152,7 @@ class SessionAffinity(CustomLogger):
 
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
         try:
+            self._rewrite_cache_ttl(data)
             if self._has_explicit_tags(data):
                 return data
             cands = await self._candidates(data.get("model"))
