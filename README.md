@@ -43,6 +43,59 @@ LiteLLM 默认的负载均衡策略(`simple-shuffle` 等)是**无状态**的,每
 
 ---
 
+## 2.1 架构示意图
+
+**请求流**(Claude Code 发一轮请求 → 稳定落到同一缓存域):
+
+```mermaid
+flowchart TD
+    CC["Claude Code / 客户端<br/>ANTHROPIC_BASE_URL 指向 proxy"]
+    CC -->|"/v1/messages 或 /v1/chat/completions"| PROXY
+
+    subgraph proxy [LiteLLM Proxy]
+        PROXY["请求进入<br/>async_pre_call_hook"]
+        PROXY --> HOOK
+
+        subgraph hook [session_affinity 回调 SessionAffinity]
+            direction TB
+            H0["改写 cache_control ttl → 1h<br/>_rewrite_cache_ttl"]
+            H1["取会话标识 _session_key<br/>user_id / session_id / system+首条消息"]
+            H2["取候选端点 _candidates<br/>读 llm_router.model_list"]
+            H3["健康过滤 _healthy_deployments<br/>剔除 cooldown 端点"]
+            H4["加权 HRW 选端点 _select<br/>score = -weight / ln(u)"]
+            H5["写 tag 到 metadata + litellm_metadata"]
+            H0 --> H1 --> H2 --> H3 --> H4 --> H5
+        end
+
+        HOOK --> ROUTER["tag 路由<br/>enable_tag_filtering"]
+    end
+
+    ROUTER -->|"tag = domain-0"| E0["端点0 (缓存域0)<br/>如 us.opus-4-7"]
+    ROUTER -->|"tag = domain-1"| E1["端点1 (缓存域1)<br/>如 jp.opus-4-7"]
+    ROUTER -->|"tag = domain-2"| E2["端点2 (缓存域2)<br/>如 eu.opus-4-7 / ARN profile"]
+
+    E0 --> C0[("Prompt Cache 域0")]
+    E1 --> C1[("Prompt Cache 域1")]
+    E2 --> C2[("Prompt Cache 域2")]
+```
+
+**配置来源**(端点、tag、权重从哪来 —— hook 运行时统一读 `llm_router.model_list`):
+
+```mermaid
+flowchart LR
+    CFG["config.yaml<br/>callbacks + enable_tag_filtering<br/>+ store_model_in_db"]
+    UI["LiteLLM UI / model_new API<br/>日常增删端点/tag/权重"]
+    DB[("Postgres<br/>store_model_in_db")]
+
+    CFG --> ML["llm_router.model_list<br/>(config + DB 合并)"]
+    UI --> DB --> ML
+    ML --> HOOKREAD["hook 启动/每次请求读取<br/>单一事实源,不漂移"]
+```
+
+> 关键点:hook 只是一个 `async_pre_call_hook` 回调,挂在请求进入模型调用**之前**;它不改路由引擎,只是给请求打上正确的 `tag`,把"选哪个缓存域"这件事变得有状态、可粘。
+
+---
+
 ## 3. 为什么用加权 HRW(而不是取模)
 
 会话标识哈希到端点,要满足"端点增减时尽量少搬动",否则一个端点 cooldown 会让**全员缓存失效**。

@@ -46,6 +46,59 @@ Capabilities:
 
 ---
 
+## 2.1 Architecture Diagram
+
+**Request flow** (one Claude Code request → stably lands on the same cache domain):
+
+```mermaid
+flowchart TD
+    CC["Claude Code / client<br/>ANTHROPIC_BASE_URL points to proxy"]
+    CC -->|"/v1/messages or /v1/chat/completions"| PROXY
+
+    subgraph proxy [LiteLLM Proxy]
+        PROXY["Request enters<br/>async_pre_call_hook"]
+        PROXY --> HOOK
+
+        subgraph hook [session_affinity callback SessionAffinity]
+            direction TB
+            H0["Rewrite cache_control ttl → 1h<br/>_rewrite_cache_ttl"]
+            H1["Extract session key _session_key<br/>user_id / session_id / system+first msg"]
+            H2["Collect candidate endpoints _candidates<br/>reads llm_router.model_list"]
+            H3["Health filter _healthy_deployments<br/>drop cooldown endpoints"]
+            H4["Weighted HRW pick _select<br/>score = -weight / ln(u)"]
+            H5["Write tag to metadata + litellm_metadata"]
+            H0 --> H1 --> H2 --> H3 --> H4 --> H5
+        end
+
+        HOOK --> ROUTER["Tag routing<br/>enable_tag_filtering"]
+    end
+
+    ROUTER -->|"tag = domain-0"| E0["Endpoint 0 (cache domain 0)<br/>e.g. us.opus-4-7"]
+    ROUTER -->|"tag = domain-1"| E1["Endpoint 1 (cache domain 1)<br/>e.g. jp.opus-4-7"]
+    ROUTER -->|"tag = domain-2"| E2["Endpoint 2 (cache domain 2)<br/>e.g. eu.opus-4-7 / ARN profile"]
+
+    E0 --> C0[("Prompt Cache domain 0")]
+    E1 --> C1[("Prompt Cache domain 1")]
+    E2 --> C2[("Prompt Cache domain 2")]
+```
+
+**Config sources** (where endpoints, tags, and weights come from — the hook always reads `llm_router.model_list` at runtime):
+
+```mermaid
+flowchart LR
+    CFG["config.yaml<br/>callbacks + enable_tag_filtering<br/>+ store_model_in_db"]
+    UI["LiteLLM UI / model_new API<br/>day-to-day endpoint/tag/weight edits"]
+    DB[("Postgres<br/>store_model_in_db")]
+
+    CFG --> ML["llm_router.model_list<br/>(config + DB merged)"]
+    UI --> DB --> ML
+    ML --> HOOKREAD["Read by hook at startup / per request<br/>single source of truth, no drift"]
+```
+
+> Key point: the hook is just an `async_pre_call_hook` callback that runs **before** the model call. It does not replace the routing engine; it only tags the request correctly, turning "which cache domain to pick" into a stateful, sticky decision.
+
+---
+
 ## 3. Why Weighted HRW Instead of Modulo Hashing
 
 The session key must map to an endpoint with minimal movement when endpoints are added, removed, or temporarily cooled down. Otherwise a single endpoint event can invalidate cache locality for nearly every session.
