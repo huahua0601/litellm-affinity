@@ -382,3 +382,9 @@ Upgrade runbook:
 | `scripts/run_distribution.py` / `scripts/run_real_test.py` | Optional end-to-end validation scripts. |
 | `secrets/.secrets.env` | Local credentials file, gitignored. |
 | `pytest.ini` | `pythonpath=src` and `testpaths=tests`. |
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).

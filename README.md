@@ -416,3 +416,9 @@ dep-eu   96  (16.0% vs 16.7%)
 | `scripts/run_distribution.py` / `scripts/run_real_test.py` | 端到端验证脚本 |
 | `secrets/.secrets.env`(本地,gitignore) | 凭证,`source` 使用,不入库 |
 | `pytest.ini` | `pythonpath=src` / `testpaths=tests` |
+
+---
+
+## 许可证
+
+本项目基于 [MIT License](LICENSE) 开源。
